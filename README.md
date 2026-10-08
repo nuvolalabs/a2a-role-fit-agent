@@ -167,6 +167,16 @@ same `context_id` / `status` / `status_timestamp_after` filters, the same
 helpers. RLS is enabled with no `anon` policies, so only the service key can touch
 task state.
 
+**Operational note (free tier):** a paused Supabase project (`status: INACTIVE`)
+restores from the snapshot taken at pause time, and the restore runs *after* the API
+returns. Applying this schema during that window appears to work — the query returns
+`201` and the table answers for a few minutes — and then the finishing restore wipes
+it. The symptom is PostgREST answering
+`PGRST205 Could not find the table 'public.a2a_tasks' in the schema cache`, which
+looks like a cache problem. Check with
+`select to_regclass('public.a2a_tasks');` (SQL, via the Management API): `null` means
+re-apply the schema. Wait for `ACTIVE_HEALTHY` first.
+
 ## Tests
 
 ```bash
