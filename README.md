@@ -55,6 +55,9 @@ python client.py --url http://127.0.0.1:8024 "Must have Python, RAG and agentic 
 python client.py --url http://127.0.0.1:8024 --card-only
 ```
 
+Calling the agent from your own client (curl, JSON-RPC, REST, gotchas):
+see [`docs/calling-from-a-client.md`](docs/calling-from-a-client.md).
+
 ## Protocol surface
 
 Verified live against a running server (see transcript below).
