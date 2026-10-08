@@ -4,11 +4,12 @@ An [Agent2Agent (A2A) protocol](https://a2a-protocol.org/) **v1.0** server that 
 real capability to other agents: evaluating how well a job description matches a
 specific engineer's *verified, shipped* skills — and reporting the gaps honestly.
 
-It publishes an Agent Card, speaks JSON-RPC 2.0 and the HTTP+JSON (REST) binding, and
-runs the full A2A task lifecycle (`submitted → working → completed`) with artifacts.
+It publishes an Agent Card, speaks JSON-RPC 2.0 and the HTTP+JSON (REST) binding, runs
+the full A2A task lifecycle (`submitted → working → completed`) with artifacts, and
+persists tasks in Postgres so state survives across serverless invocations.
 
 Built with the official [`a2a-sdk`](https://github.com/a2aproject/a2a-python) (1.2.x,
-protocol 1.0) on FastAPI. 25 tests, no network or LLM required to run them.
+protocol 1.0) on FastAPI. 43 tests, no network or LLM required to run them.
 
 ```
 client agent  --GET /.well-known/agent-card.json-->  discover
@@ -69,8 +70,8 @@ Verified live against a running server (see transcript below).
 | Push notification configs | `Create/Get/List/DeleteTaskPushNotificationConfig` | `/tasks/{id}/pushNotificationConfigs` | advertised (`capabilities.pushNotifications`) |
 | Agent Card | — | `GET /.well-known/agent-card.json` | implemented |
 
-Method names are readonly PascalCase in v1.0 — the pre-1.0 names (`message/send`,
-`tasks/get`) are **not** used here.
+Method names are PascalCase in v1.0 — the pre-1.0 names (`message/send`, `tasks/get`)
+are **not** used here.
 
 Requests carry `A2A-Version: 1.0`. The binding also exposes a v0.3 compatibility mode
 that this server leaves off.
@@ -125,20 +126,66 @@ Unclaimed requirements (2):
 Note the honest negative result: the report **does not** claim LangChain or Kubernetes.
 `GetTask` for the same task returns `TASK_STATE_COMPLETED` with the same artifact.
 
+## Task persistence
+
+The default store is in-memory, which is fine for one long-lived process but **wrong
+for serverless**: a task created by one invocation is gone by the next, so a follow-up
+`GetTask` returns not-found and the agent looks broken.
+
+Set `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` and the app automatically uses
+`SupabaseTaskStore` — a `TaskStore` backed by Supabase PostgREST over HTTPS. That
+avoids the SQLAlchemy/driver route (and the serverless pooler + prepared-statement
+pitfalls that come with asyncpg) while giving real cross-invocation persistence.
+
+```bash
+# apply the schema (once), via the Supabase Management API
+curl -s -X POST "https://api.supabase.com/v1/projects/$REF/database/query" \
+  -H "Authorization: Bearer $SUPABASE_PAT" -H "Content-Type: application/json" \
+  -d "{\"query\": $(python3 -c 'import json;print(json.dumps(open("supabase/schema.sql").read()))')}"
+```
+
+Verified against live Supabase: `save` → `get` through a **fresh client instance** →
+`list` → `delete` → `get` returns nothing:
+
+```
+save: ok
+get via a FRESH client instance: FOUND
+  id        : roundtrip-proof-0001
+  context_id: ctx-proof
+  state     : 3
+  artifact  : persisted through Supabase PostgREST
+  timestamp : 2026-10-08T02:32:10.546361Z
+list: total_size = 1 | contains proof: True
+delete then get: MISSING (correct)
+ROUND-TRIP: PASS
+```
+
+Storage semantics mirror the SDK's in-memory store: tasks are scoped per owner
+(`context.user.user_name`, empty for unauthenticated callers), `ListTasks` supports the
+same `context_id` / `status` / `status_timestamp_after` filters, the same
+`(has_timestamp, timestamp, id)` descending order, and the same cursor pagination
+helpers. RLS is enabled with no `anon` policies, so only the service key can touch
+task state.
+
 ## Tests
 
 ```bash
 python -m unittest discover -s tests -t . -v
 ```
 
-25 tests in two suites:
+43 tests in three suites:
 
 - `tests/test_fit.py` — scoring determinism, must-have gap detection, evidence
   attachment, and **profile-integrity guards** (a capability may never be listed as
   both a strength and a gap).
 - `tests/test_server.py` — real HTTP against the ASGI app: card contents at the
   well-known path, both bindings, `SendMessage`/`GetTask` round-trip, JSON-RPC error
-  codes, artifact payload.
+  codes, artifact payload. Injects an explicit in-memory store so tests never touch
+  Supabase.
+- `tests/test_store.py` — the PostgREST store against a fake PostgREST over
+  `httpx.MockTransport`: upsert rather than duplicate, owner scoping, protobuf
+  round-trip fidelity, RFC3339 timestamps, pagination cursors, filters, and store
+  selection from the environment.
 
 ## Deploy
 
@@ -149,17 +196,18 @@ python -m unittest discover -s tests -t . -v
 
 ```bash
 vercel --prod
-vercel env add A2A_BASE_URL production   # e.g. https://<project>.vercel.app
+vercel env add A2A_BASE_URL production            # https://<project>.vercel.app
+vercel env add SUPABASE_URL production            # https://<ref>.supabase.co
+vercel env add SUPABASE_SERVICE_KEY production    # service key, server-side only
 ```
 
-Set `A2A_BASE_URL` so the Agent Card advertises the real public URLs, not localhost.
-
-**Serverless caveat:** the default task store is in-memory, so task state does not
-survive across invocations. For production on serverless, swap in the SDK's
-database-backed store (`a2a.server.tasks.database_task_store`) — see
-`build_task_store()` in `src/rolefit/app.py`. Streaming responses are also capped by
-the function's max duration, which is why the long-lived/streaming path is better on a
-container.
+- `A2A_BASE_URL` must be the public URL so the Agent Card advertises real endpoints
+  rather than localhost.
+- `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` are what make `GetTask` work across
+  invocations. Without them the app logs a warning and falls back to memory.
+- Streaming (`SendStreamingMessage`) is capped by the function's max duration. The
+  card still advertises `capabilities.streaming` because the route exists; a container
+  is the better home for long-lived SSE.
 
 ### Container (Railway / Cloud Run / Fly)
 
@@ -168,22 +216,24 @@ docker build -t a2a-role-fit-agent .
 docker run -p 8080:8080 -e A2A_BASE_URL=http://localhost:8080 a2a-role-fit-agent
 ```
 
-The container runs a single long-lived process, so in-memory task state, SSE streaming
-and push notifications all work as the spec intends.
+A single long-lived process, so in-memory task state, SSE streaming and push
+notifications all behave exactly as the spec intends.
 
 ## Layout
 
 ```
 src/rolefit/
-  card.py       # Agent Card (v1.0): interfaces, capabilities, skills
-  fit.py        # pure deterministic scoring + report rendering
-  executor.py   # AgentExecutor: task lifecycle, status updates, artifact
-  app.py        # FastAPI app factory, binds card + JSON-RPC + REST routes
-  profile.json  # the candidate profile the agent reasons over
-  __main__.py   # `python -m rolefit`
-client.py       # stdlib A2A client: card handshake + SendMessage
-api/index.py    # Vercel entrypoint
-tests/          # 25 tests
+  card.py        # Agent Card (v1.0): interfaces, capabilities, skills
+  fit.py         # pure deterministic scoring + report rendering
+  executor.py    # AgentExecutor: task lifecycle, status updates, artifact
+  store.py       # SupabaseTaskStore: PostgREST-backed task persistence
+  app.py         # FastAPI app factory, binds card + JSON-RPC + REST routes
+  profile.json   # the candidate profile the agent reasons over
+  __main__.py    # `python -m rolefit`
+client.py        # stdlib A2A client: card handshake + SendMessage
+api/index.py     # Vercel entrypoint
+supabase/schema.sql   # a2a_tasks table (RLS on, no anon policies)
+tests/           # 43 tests
 ```
 
 ## Design notes
@@ -195,5 +245,8 @@ tests/          # 25 tests
   testable and free. An LLM layer (rewriting the report in prose, or extracting
   requirements from messy postings) is a natural next step and would sit *behind* this
   core, not replace it.
+- **Persistence is a deployment concern, not a protocol one.** The A2A spec does not
+  care where task state lives; the store is injectable so the same app runs correctly
+  in-memory on a container and on Postgres behind serverless.
 - **The protocol is the product.** The SDK handles the wire format; this repo's job is
   to show a correct card, a correct task lifecycle, and both bindings.

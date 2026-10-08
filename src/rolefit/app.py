@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 from a2a.server.request_handlers import DefaultRequestHandler
@@ -17,28 +18,44 @@ from fastapi import FastAPI
 from .card import build_agent_card
 from .executor import RoleFitExecutor
 from .fit import load_profile, portfolio_summary, render_fit_report, score_role_fit
+from .store import SupabaseTaskStore
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8024"
 
 
 def build_task_store():
-    """In-memory by default.
+    """Supabase-backed when configured, otherwise in-memory.
 
-    A single-process deployment is fine with memory. Serverless/multi-instance
-    deployments must swap in a database-backed store so task state survives
-    across invocations (see a2a.server.tasks.database_task_store).
+    In-memory state dies with the process, so a serverless deployment MUST set
+    SUPABASE_URL + SUPABASE_SERVICE_KEY — otherwise GetTask for a task created by
+    an earlier invocation returns not-found, which looks like a broken agent.
     """
+    url = os.environ.get("SUPABASE_URL")
+    key = (os.environ.get("SUPABASE_SERVICE_KEY")
+           or os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
+    if url and key:
+        table = os.environ.get("A2A_TASKS_TABLE", "a2a_tasks")
+        return SupabaseTaskStore(url, key, table=table)
+    logger.warning(
+        "SUPABASE_URL/SUPABASE_SERVICE_KEY not set: falling back to in-memory "
+        "task storage (task state will NOT survive across invocations).")
     return InMemoryTaskStore()
 
 
-def create_app(base_url: str | None = None) -> FastAPI:
-    """Build the ASGI app: agent card + JSON-RPC binding + REST binding."""
+def create_app(base_url: str | None = None, task_store=None) -> FastAPI:
+    """Build the ASGI app: agent card + JSON-RPC binding + REST binding.
+
+    `task_store` can be injected (tests do this); otherwise it is selected from
+    the environment - Supabase when configured, in-memory otherwise.
+    """
     base = (base_url or os.environ.get("A2A_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
     profile = load_profile()
     card = build_agent_card(base)
     handler = DefaultRequestHandler(
         agent_executor=RoleFitExecutor(profile),
-        task_store=build_task_store(),
+        task_store=task_store if task_store is not None else build_task_store(),
         agent_card=card,
     )
 

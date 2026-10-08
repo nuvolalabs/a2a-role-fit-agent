@@ -10,15 +10,23 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from a2a.server.tasks import InMemoryTaskStore  # noqa: E402
 from rolefit.app import create_app  # noqa: E402
 
 CARD_URL = "/.well-known/agent-card.json"
+
+
+def new_app():
+    """Hermetic app: explicit in-memory store so tests never touch Supabase."""
+    return create_app("https://example.test", task_store=InMemoryTaskStore())
+
+
 JD = "Must have Python, RAG and agentic orchestration. Nice to have FastAPI and MCP."
 
 
 class TestAgentCard(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(create_app("https://example.test"))
+        self.client = TestClient(new_app())
 
     def test_card_is_served_at_well_known_path(self):
         r = self.client.get(CARD_URL)
@@ -52,7 +60,7 @@ class TestAgentCard(unittest.TestCase):
 
 class TestJsonRpcBinding(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(create_app("https://example.test"))
+        self.client = TestClient(new_app())
 
     def _rpc(self, method, params=None, rpc_id=1):
         payload = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
@@ -108,7 +116,7 @@ class TestJsonRpcBinding(unittest.TestCase):
 
 class TestRestBinding(unittest.TestCase):
     def test_message_send_endpoint_completes_a_task(self):
-        client = TestClient(create_app("https://example.test"))
+        client = TestClient(new_app())
         r = client.post("/rest/message:send",
                         json={"message": {"messageId": "r-1", "role": "ROLE_USER",
                                           "parts": [{"text": JD}]}},
@@ -123,7 +131,7 @@ class TestRestBinding(unittest.TestCase):
 
 class TestConvenienceEndpoints(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(create_app("https://example.test"))
+        self.client = TestClient(new_app())
 
     def test_fit_endpoint(self):
         body = self.client.get("/fit", params={"jd": JD}).json()
